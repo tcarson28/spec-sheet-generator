@@ -1,7 +1,7 @@
 const {
   Document, Packer, Paragraph, Table, TableCell, TableRow,
   AlignmentType, BorderStyle, WidthType, TextRun, PageBreak,
-  convertInchesToTwip, ShadingType, VerticalAlign
+  ImageRun, convertInchesToTwip, ShadingType
 } = require('docx');
 const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
@@ -15,13 +15,13 @@ const supabase = createClient(
   process.env.SUPABASE_ANON_KEY
 );
 
-// ─── Translation ────────────────────────────────────────────────────────────
+// ─── Translation ─────────────────────────────────────────────────────────────
 
 async function translateToChinese(text) {
   if (!text || text.trim() === '') return text;
   try {
     const message = await client.messages.create({
-      model: 'claude-opus-4-5',
+      model: 'claude-sonnet-4-6',
       max_tokens: 1024,
       messages: [{
         role: 'user',
@@ -35,12 +35,66 @@ async function translateToChinese(text) {
   }
 }
 
-// ─── Table builder ───────────────────────────────────────────────────────────
+// ─── Image helpers ────────────────────────────────────────────────────────────
+
+function getMimeType(mimeType) {
+  const map = {
+    'image/jpeg': 'jpg',
+    'image/jpg': 'jpg',
+    'image/png': 'png',
+    'image/gif': 'gif',
+    'image/webp': 'webp'
+  };
+  return map[(mimeType || '').toLowerCase()] || 'jpg';
+}
+
+// Returns an array of Paragraphs containing the image, or [] if no image
+function buildImageBlock(imageBase64, imageMimeType, imagePlacement) {
+  if (!imageBase64) return [];
+
+  const imageBuffer = Buffer.from(imageBase64, 'base64');
+  const type = getMimeType(imageMimeType);
+
+  // Width and alignment based on placement
+  let width, height, alignment;
+  switch (imagePlacement) {
+    case 'top-full':
+      width = 600; height = 360;
+      alignment = AlignmentType.CENTER;
+      break;
+    case 'top-center':
+      width = 360; height = 270;
+      alignment = AlignmentType.CENTER;
+      break;
+    case 'top-right':
+      width = 280; height = 210;
+      alignment = AlignmentType.RIGHT;
+      break;
+    default:
+      width = 360; height = 270;
+      alignment = AlignmentType.CENTER;
+  }
+
+  return [
+    new Paragraph({
+      alignment,
+      spacing: { before: 160, after: 240 },
+      children: [
+        new ImageRun({
+          data: imageBuffer,
+          transformation: { width, height },
+          type
+        })
+      ]
+    })
+  ];
+}
+
+// ─── Spec table ───────────────────────────────────────────────────────────────
 
 function createSpecTable(specs) {
   const BLUE = '0056A8';
   const LIGHT_GRAY = 'F5F7FA';
-
   const cellBorder = { style: BorderStyle.SINGLE, size: 1, color: 'CCCCCC' };
   const borders = {
     top: cellBorder, bottom: cellBorder,
@@ -103,7 +157,7 @@ function createSpecTable(specs) {
   });
 }
 
-// ─── Title section ────────────────────────────────────────────────────────────
+// ─── Title + description ──────────────────────────────────────────────────────
 
 function createTitleSection(productName, productDescription) {
   return [
@@ -113,22 +167,14 @@ function createTitleSection(productName, productDescription) {
       children: [
         new TextRun({
           text: productName.toUpperCase() + ' \u2014 SPECIFICATION SHEET',
-          font: 'Arial',
-          size: 32,
-          bold: true,
-          color: '0056A8'
+          font: 'Arial', size: 32, bold: true, color: '0056A8'
         })
       ]
     }),
     new Paragraph({
-      spacing: { before: 160, after: 320 },
+      spacing: { before: 160, after: 240 },
       children: [
-        new TextRun({
-          text: productDescription,
-          font: 'Arial',
-          size: 22,
-          color: '555555'
-        })
+        new TextRun({ text: productDescription, font: 'Arial', size: 22, color: '555555' })
       ]
     })
   ];
@@ -136,14 +182,19 @@ function createTitleSection(productName, productDescription) {
 
 function createSectionHeader(text) {
   return new Paragraph({
-    spacing: { before: 320, after: 160 },
+    spacing: { before: 240, after: 160 },
+    children: [new TextRun({ text, font: 'Arial', size: 24, bold: true, color: '333333' })]
+  });
+}
+
+function createFooter() {
+  return new Paragraph({
+    spacing: { before: 480 },
+    border: { top: { style: BorderStyle.SINGLE, size: 4, color: '0056A8', space: 4 } },
     children: [
       new TextRun({
-        text: text,
-        font: 'Arial',
-        size: 24,
-        bold: true,
-        color: '333333'
+        text: 'SourcePoint  \u2022  sourcepointco.com  \u2022  hello@sourcepointco.com',
+        font: 'Arial', size: 18, color: '888888'
       })
     ]
   });
@@ -185,11 +236,15 @@ exports.handler = async (event) => {
     const {
       productName, productDescription, dimensions, materials,
       colors, weight, standards, moq, leadTime, pricingTier,
-      qualityAssurance, shipping
+      qualityAssurance, shipping,
+      imageBase64, imageMimeType, imagePlacement
     } = JSON.parse(event.body);
 
     if (!productName || !productDescription) {
-      return { statusCode: 400, body: JSON.stringify({ error: 'Missing required fields: productName and productDescription' }) };
+      return {
+        statusCode: 400,
+        body: JSON.stringify({ error: 'Missing required fields: productName and productDescription' })
+      };
     }
 
     // Translate all fields in parallel
@@ -242,16 +297,10 @@ exports.handler = async (event) => {
       shipping && ['包装与运输', cnShipping]
     ].filter(Boolean);
 
-    // Footer paragraph
-    const footer = new Paragraph({
-      spacing: { before: 480 },
-      border: { top: { style: BorderStyle.SINGLE, size: 4, color: '0056A8', space: 4 } },
-      children: [
-        new TextRun({ text: 'SourcePoint  \u2022  sourcepointco.com  \u2022  hello@sourcepointco.com', font: 'Arial', size: 18, color: '888888' })
-      ]
-    });
+    // Image blocks (same image on both pages)
+    const imageBlock = buildImageBlock(imageBase64, imageMimeType, imagePlacement);
 
-    // Build document — NOTE: PageBreak must be inside a Paragraph
+    // Build document
     const doc = new Document({
       sections: [{
         properties: {
@@ -265,26 +314,22 @@ exports.handler = async (event) => {
           }
         },
         children: [
-          // English page
+          // ── English page ──
           ...createTitleSection(productName, productDescription),
+          ...imageBlock,
           createSectionHeader('SPECIFICATION SUMMARY'),
           createSpecTable(engSpecs),
-          footer,
+          createFooter(),
 
-          // Page break — MUST be inside a Paragraph
+          // ── Page break — must be inside a Paragraph ──
           new Paragraph({ children: [new PageBreak()] }),
 
-          // Chinese page
+          // ── Chinese page ──
           ...createTitleSection(cnProductName, cnProductDescription),
+          ...imageBlock,
           createSectionHeader('规格说明总表'),
           createSpecTable(cnSpecs),
-          new Paragraph({
-            spacing: { before: 480 },
-            border: { top: { style: BorderStyle.SINGLE, size: 4, color: '0056A8', space: 4 } },
-            children: [
-              new TextRun({ text: 'SourcePoint  \u2022  sourcepointco.com  \u2022  hello@sourcepointco.com', font: 'Arial', size: 18, color: '888888' })
-            ]
-          })
+          createFooter()
         ]
       }]
     });
@@ -298,7 +343,6 @@ exports.handler = async (event) => {
       qualityAssurance, shipping
     }).catch(err => console.error('Archive save failed:', err));
 
-    // Return base64-encoded buffer — isBase64Encoded: true is required for binary
     return {
       statusCode: 200,
       headers: {
