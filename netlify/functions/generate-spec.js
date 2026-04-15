@@ -15,23 +15,66 @@ const supabase = createClient(
   process.env.SUPABASE_ANON_KEY
 );
 
-// ─── Translation ─────────────────────────────────────────────────────────────
+// ─── Translation — single batched call ───────────────────────────────────────
+// All fields translated in ONE API call instead of 12 separate calls.
+// This keeps the function well within Netlify's 10-second timeout limit.
 
-async function translateToChinese(text) {
-  if (!text || text.trim() === '') return text;
+async function translateAllFieldsToChinese(fields) {
+  // Build the list of fields that have actual content
+  const toTranslate = Object.entries(fields).filter(([, v]) => v && v.trim() !== '');
+
+  if (toTranslate.length === 0) return fields;
+
+  // Format as a numbered list for the model to translate
+  const numbered = toTranslate
+    .map(([key, value], i) => `${i + 1}. [${key}]: ${value}`)
+    .join('\n');
+
   try {
     const message = await client.messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 1024,
+      max_tokens: 2048,
       messages: [{
         role: 'user',
-        content: `Translate the following text to Simplified Chinese. Return ONLY the translated text, no commentary:\n\n${text}`
+        content: `Translate each of the following items to Simplified Chinese.
+Return ONLY a numbered list in exactly the same format, replacing the English text after the colon with the Chinese translation.
+Keep the numbering and the [key] labels exactly as they are. Do not add any commentary.
+
+${numbered}`
       }]
     });
-    return message.content[0].type === 'text' ? message.content[0].text : text;
+
+    const responseText = message.content[0].type === 'text' ? message.content[0].text : '';
+
+    // Parse the numbered response back into a key-value map
+    const translated = { ...fields };
+    const lines = responseText.split('\n').filter(l => l.trim());
+
+    lines.forEach((line, i) => {
+      // Match lines like: 1. [productName]: 翻译后的文本
+      const match = line.match(/^\d+\.\s*\[([^\]]+)\]:\s*(.+)$/);
+      if (match) {
+        const key = match[1];
+        const value = match[2].trim();
+        if (key in translated) {
+          translated[key] = value;
+        }
+      } else if (toTranslate[i]) {
+        // Fallback: if parsing fails, try index-based matching
+        const colonIdx = line.indexOf(']:');
+        if (colonIdx !== -1) {
+          const key = toTranslate[i][0];
+          const value = line.slice(colonIdx + 2).trim();
+          if (value) translated[key] = value;
+        }
+      }
+    });
+
+    return translated;
   } catch (error) {
-    console.error('Translation error:', error);
-    return text;
+    console.error('Batch translation error:', error.message);
+    // Return originals on failure — function still completes
+    return fields;
   }
 }
 
@@ -48,14 +91,12 @@ function getMimeType(mimeType) {
   return map[(mimeType || '').toLowerCase()] || 'jpg';
 }
 
-// Returns an array of Paragraphs containing the image, or [] if no image
 function buildImageBlock(imageBase64, imageMimeType, imagePlacement) {
   if (!imageBase64) return [];
 
   const imageBuffer = Buffer.from(imageBase64, 'base64');
   const type = getMimeType(imageMimeType);
 
-  // Width and alignment based on placement
   let width, height, alignment;
   switch (imagePlacement) {
     case 'top-full':
@@ -80,11 +121,7 @@ function buildImageBlock(imageBase64, imageMimeType, imagePlacement) {
       alignment,
       spacing: { before: 160, after: 240 },
       children: [
-        new ImageRun({
-          data: imageBuffer,
-          transformation: { width, height },
-          type
-        })
+        new ImageRun({ data: imageBuffer, transformation: { width, height }, type })
       ]
     })
   ];
@@ -157,7 +194,7 @@ function createSpecTable(specs) {
   });
 }
 
-// ─── Title + description ──────────────────────────────────────────────────────
+// ─── Page sections ────────────────────────────────────────────────────────────
 
 function createTitleSection(productName, productDescription) {
   return [
@@ -247,27 +284,23 @@ exports.handler = async (event) => {
       };
     }
 
-    // Translate all fields in parallel
-    console.log('Starting translations...');
-    const [
-      cnProductName, cnProductDescription, cnDimensions, cnMaterials,
-      cnColors, cnWeight, cnStandards, cnMoq, cnLeadTime,
-      cnPricingTier, cnQualityAssurance, cnShipping
-    ] = await Promise.all([
-      translateToChinese(productName),
-      translateToChinese(productDescription),
-      translateToChinese(dimensions),
-      translateToChinese(materials),
-      translateToChinese(colors),
-      translateToChinese(weight),
-      translateToChinese(standards),
-      translateToChinese(moq),
-      translateToChinese(leadTime),
-      translateToChinese(pricingTier),
-      translateToChinese(qualityAssurance),
-      translateToChinese(shipping)
-    ]);
-    console.log('Translations complete.');
+    // Single batched translation call — all fields in one request
+    console.log('Starting batched translation...');
+    const translated = await translateAllFieldsToChinese({
+      productName,
+      productDescription,
+      dimensions,
+      materials,
+      colors,
+      weight,
+      standards,
+      moq,
+      leadTime,
+      pricingTier,
+      qualityAssurance,
+      shipping
+    });
+    console.log('Translation complete.');
 
     // English spec rows
     const engSpecs = [
@@ -283,18 +316,18 @@ exports.handler = async (event) => {
       shipping && ['Packaging & Shipping', shipping]
     ].filter(Boolean);
 
-    // Chinese spec rows
+    // Chinese spec rows — using translated values
     const cnSpecs = [
-      ['尺寸', cnDimensions],
-      ['材料', cnMaterials],
-      colors && ['可用颜色', cnColors],
-      weight && ['重量', cnWeight],
-      standards && ['标准与认证', cnStandards],
-      ['最小订购量（MOQ）', cnMoq],
-      ['交货期', cnLeadTime],
-      ['定价信息', cnPricingTier],
-      qualityAssurance && ['质量保证', cnQualityAssurance],
-      shipping && ['包装与运输', cnShipping]
+      ['尺寸', translated.dimensions],
+      ['材料', translated.materials],
+      colors && ['可用颜色', translated.colors],
+      weight && ['重量', translated.weight],
+      standards && ['标准与认证', translated.standards],
+      ['最小订购量（MOQ）', translated.moq],
+      ['交货期', translated.leadTime],
+      ['定价信息', translated.pricingTier],
+      qualityAssurance && ['质量保证', translated.qualityAssurance],
+      shipping && ['包装与运输', translated.shipping]
     ].filter(Boolean);
 
     // Image blocks (same image on both pages)
@@ -314,18 +347,18 @@ exports.handler = async (event) => {
           }
         },
         children: [
-          // ── English page ──
+          // English page
           ...createTitleSection(productName, productDescription),
           ...imageBlock,
           createSectionHeader('SPECIFICATION SUMMARY'),
           createSpecTable(engSpecs),
           createFooter(),
 
-          // ── Page break — must be inside a Paragraph ──
+          // Page break — must be inside a Paragraph
           new Paragraph({ children: [new PageBreak()] }),
 
-          // ── Chinese page ──
-          ...createTitleSection(cnProductName, cnProductDescription),
+          // Chinese page
+          ...createTitleSection(translated.productName, translated.productDescription),
           ...imageBlock,
           createSectionHeader('规格说明总表'),
           createSpecTable(cnSpecs),
